@@ -475,6 +475,7 @@ pub struct DmaTxBuf {
     descriptors: DescriptorSet<'static>,
     buffer: &'static mut [u8],
     burst: BurstConfig,
+    is_circular: bool,
 }
 
 impl DmaTxBuf {
@@ -510,6 +511,33 @@ impl DmaTxBuf {
             descriptors: DescriptorSet::new(descriptors)?,
             buffer,
             burst: BurstConfig::default(),
+            is_circular: false,
+        };
+
+        let capacity = buf.capacity();
+        buf.configure(config, capacity)?;
+
+        Ok(buf)
+    }
+
+    /// Creates a new circular [DmaTxBuf] from some descriptors and a buffer.
+    ///
+    /// There must be enough descriptors for the provided buffer.
+    /// Depending on alignment requirements, each descriptor can handle at most
+    /// 4095 bytes worth of buffer.
+    ///
+    /// Both the descriptors and buffer must be in DMA-capable memory.
+    /// Only DRAM is supported for descriptors.
+    pub fn new_circular(
+        descriptors: &'static mut [DmaDescriptor],
+        buffer: &'static mut [u8],
+        config: impl Into<BurstConfig>,
+    ) -> Result<Self, DmaBufError> {
+        let mut buf = Self {
+            descriptors: DescriptorSet::new(descriptors)?,
+            buffer,
+            burst: BurstConfig::default(),
+            is_circular: true,
         };
 
         let capacity = buf.capacity();
@@ -526,9 +554,11 @@ impl DmaTxBuf {
         let burst = burst.into();
         self.set_length_fallible(length, burst)?;
 
-        self.descriptors.link_with_buffer(
+        DescriptorSet::set_up_buffer_ptrs(
             self.buffer,
+            self.descriptors.descriptors,
             burst.max_chunk_size_for(self.buffer, TransferDirection::Out),
+            self.is_circular,
         )?;
 
         self.burst = burst;
@@ -560,15 +590,24 @@ impl DmaTxBuf {
             .sum::<usize>()
     }
 
-    fn set_length_fallible(&mut self, len: usize, burst: BurstConfig) -> Result<(), DmaBufError> {
+    fn set_length_fallible(
+        &mut self,
+        len: usize,
+        burst: BurstConfig,
+    ) -> Result<(), DmaBufError> {
         if len > self.capacity() {
             return Err(DmaBufError::BufferTooSmall);
         }
         burst.ensure_buffer_compatible(&self.buffer[..len], TransferDirection::Out)?;
 
-        self.descriptors.set_tx_length(
+        DescriptorSet::set_up_descriptors(
+            self.descriptors.descriptors,
             len,
             burst.max_chunk_size_for(self.buffer, TransferDirection::Out),
+            self.is_circular,
+            |desc, chunk_size| {
+                desc.set_length(chunk_size);
+            },
         )
     }
 
@@ -606,10 +645,12 @@ unsafe impl DmaTxBuffer for DmaTxBuf {
     type View = BufView<DmaTxBuf>;
 
     fn prepare(&mut self) -> Preparation {
-        for desc in self.descriptors.linked_iter_mut() {
-            // In non-circular mode, we only set `suc_eof` for the last descriptor to signal
-            // the end of the transfer.
-            desc.reset_for_tx(desc.next.is_null());
+        {
+            let mut iter = self.descriptors.linked_iter_mut().peekable();
+            loop {
+                let Some(next) = iter.next() else { break };
+                next.reset_for_tx(iter.peek().is_none());
+            }
         }
 
         cfg_if::cfg_if! {
